@@ -115,6 +115,8 @@ static void reply_execute(uint32 status);
 static void receive_handshake();
 
 #if SYZ_EXECUTOR_USES_FORK_SERVER
+static void SnapshotPrepareParent();
+
 // Allocating (and forking) virtual memory for each executed process is expensive, so we only mmap
 // the amount we might possibly need for the specific received prog.
 const int kMaxOutputComparisons = 14 << 20; // executions with comparsions enabled are usually < 1% of all executions
@@ -141,12 +143,13 @@ bool IsSet(T flags, T f)
 
 const uint32 kMaxCalls = 64;
 std::ofstream outfile;
-char tmp_filename[L_tmpnam];
+const char* tmp_filename = "/tmp/always-here.txt";
 
 struct alignas(8) OutputData {
 	std::atomic<uint32> size;
 	std::atomic<uint32> consumed;
 	std::atomic<uint32> completed;
+	std::atomic<uint32> num_calls;
 	struct {
 		// Call index in the test program (they may be out-of-order is some syscalls block).
 		int index;
@@ -159,6 +162,7 @@ struct alignas(8) OutputData {
 		size.store(0, std::memory_order_relaxed);
 		consumed.store(0, std::memory_order_relaxed);
 		completed.store(0, std::memory_order_relaxed);
+		num_calls.store(0, std::memory_order_relaxed);
 	}
 };
 
@@ -248,10 +252,11 @@ static std::optional<ShmemBuilder> output_builder;
 static uint32 output_size;
 static void mmap_output(uint32 size);
 static uint32 hash(uint32 a);
-static bool dedup(uint32 sig);
+static bool dedup(uint8 index, uint64 sig);
 
 static uint64 start_time_ms = 0;
 static bool flag_debug;
+static bool flag_snapshot;
 static bool flag_coverage;
 static bool flag_sandbox_none;
 static bool flag_sandbox_setuid;
@@ -466,9 +471,11 @@ static void copyin(char* addr, uint64 val, uint64 size, uint64 bf, uint64 bf_off
 static bool copyout(char* addr, uint64 size, uint64* res);
 static void setup_control_pipes();
 static bool coverage_filter(uint64 pc);
-static std::tuple<rpc::ComparisonRaw, bool, bool> convert(const kcov_comparison_t& cmp);
-static flatbuffers::span<uint8_t> finish_output(OutputData* output, int proc_id, uint64 req_id,
+static rpc::ComparisonRaw convert(const kcov_comparison_t& cmp);
+static flatbuffers::span<uint8_t> finish_output(OutputData* output, int proc_id, uint64 req_id, uint32 num_calls,
 						uint64 elapsed, uint64 freshness, uint32 status, const std::vector<uint8_t>* process_output);
+static void parse_execute(const execute_req& req);
+static void parse_handshake(const handshake_req& req);
 
 #include "syscalls.h"
 
@@ -499,6 +506,8 @@ static feature_t features[] = {};
 #include "files.h"
 #include "subprocess.h"
 
+#include "snapshot.h"
+
 #include "executor_runner.h"
 
 #include "test.h"
@@ -512,11 +521,15 @@ static uint64 sandbox_arg = 0;
 
 int main(int argc, char** argv)
 {
-	if (argc >= 2 && strcmp(argv[1], "runner") == 0) {
+	if (argc == 1) {
+		fprintf(stderr, "no command");
+		return 1;
+	}
+	if (strcmp(argv[1], "runner") == 0) {
 		runner(argv, argc);
 		fail("runner returned");
 	}
-	if (argc >= 2 && strcmp(argv[1], "leak") == 0) {
+	if (strcmp(argv[1], "leak") == 0) {
 #if SYZ_HAVE_LEAK_CHECK
 		check_leaks(argv + 2, argc - 2);
 #else
@@ -524,10 +537,10 @@ int main(int argc, char** argv)
 #endif
 		return 0;
 	}
-	if (argc >= 2 && strcmp(argv[1], "test") == 0)
+	if (strcmp(argv[1], "test") == 0)
 		return run_tests(argc == 3 ? argv[2] : nullptr);
 
-	if (argc < 2 || strcmp(argv[1], "exec") != 0) {
+	if (strcmp(argv[1], "exec") != 0) {
 		fprintf(stderr, "unknown command");
 		return 1;
 	}
@@ -535,60 +548,55 @@ int main(int argc, char** argv)
 	start_time_ms = current_time_ms();
 
 	os_init(argc, argv, (char*)SYZ_DATA_OFFSET, SYZ_NUM_PAGES * SYZ_PAGE_SIZE);
-	current_thread = &threads[0];
-
-	void* mmap_out = mmap(NULL, kMaxInput, PROT_READ, MAP_SHARED, kInFd, 0);
-	if (mmap_out == MAP_FAILED)
-		fail("mmap of input file failed");
-	input_data = static_cast<uint8*>(mmap_out);
-
-	mmap_output(kInitialOutput);
-	// Prevent test programs to mess with these fds.
-	// Due to races in collider mode, a program can e.g. ftruncate one of these fds,
-	// which will cause fuzzer to crash.
-	close(kInFd);
-#if !SYZ_EXECUTOR_USES_FORK_SERVER
-	close(kOutFd);
-#endif
-	// For SYZ_EXECUTOR_USES_FORK_SERVER, close(kOutFd) is invoked in the forked child,
-	// after the program has been received.
-
-	if (fcntl(kMaxSignalFd, F_GETFD) != -1) {
-		// Use random addresses for coverage filters to not collide with output_data.
-		max_signal.emplace(kMaxSignalFd, reinterpret_cast<void*>(0x110c230000ull));
-		close(kMaxSignalFd);
-	}
-	if (fcntl(kCoverFilterFd, F_GETFD) != -1) {
-		cover_filter.emplace(kCoverFilterFd, reinterpret_cast<void*>(0x110f230000ull));
-		close(kCoverFilterFd);
-		//failmsg("aok cover filter valid", "cover filter valid");
-		debug("aok cover filter valid\n");
-	} else {
-		//failmsg("cover filter not valid bruh", "cover filter not valid");
-		debug("bruh cover filter not valid\n");
-	}
-	tmpnam(tmp_filename);
-
-	outfile.open(tmp_filename, std::ios::binary);
-	if (!outfile) {
-		return 1;
-	}
-
-	const char* link_path = "/tmp/always-here";
-    if (symlink(tmp_filename, link_path) == -1) {
-        return 1;
-    }
-
 	use_temporary_dir();
 	install_segv_handler();
-	setup_control_pipes();
-	receive_handshake();
+	current_thread = &threads[0];
+
+	if (argc > 2 && strcmp(argv[2], "snapshot") == 0) {
+		SnapshotSetup(argv, argc);
+	} else {
+		void* mmap_out = mmap(NULL, kMaxInput, PROT_READ, MAP_SHARED, kInFd, 0);
+		if (mmap_out == MAP_FAILED)
+			fail("mmap of input file failed");
+		input_data = static_cast<uint8*>(mmap_out);
+
+		mmap_output(kInitialOutput);
+
+		// Prevent test programs to mess with these fds.
+		// Due to races in collider mode, a program can e.g. ftruncate one of these fds,
+		// which will cause fuzzer to crash.
+		close(kInFd);
 #if !SYZ_EXECUTOR_USES_FORK_SERVER
-	// We receive/reply handshake when fork server is disabled just to simplify runner logic.
-	// It's a bit suboptimal, but no fork server is much slower anyway.
-	reply_execute(0);
-	receive_execute();
+		// For SYZ_EXECUTOR_USES_FORK_SERVER, close(kOutFd) is invoked in the forked child,
+		// after the program has been received.
+		close(kOutFd);
 #endif
+
+		if (fcntl(kMaxSignalFd, F_GETFD) != -1) {
+			// Use random addresses for coverage filters to not collide with output_data.
+			max_signal.emplace(kMaxSignalFd, reinterpret_cast<void*>(0x110c230000ull));
+			close(kMaxSignalFd);
+		}
+		if (fcntl(kCoverFilterFd, F_GETFD) != -1) {
+			cover_filter.emplace(kCoverFilterFd, reinterpret_cast<void*>(0x110f230000ull));
+			close(kCoverFilterFd);
+		}
+
+		outfile.open(tmp_filename, std::ios::binary);
+		if (!outfile) {
+			return 1;
+		}
+
+		setup_control_pipes();
+		receive_handshake();
+#if !SYZ_EXECUTOR_USES_FORK_SERVER
+		// We receive/reply handshake when fork server is disabled just to simplify runner logic.
+		// It's a bit suboptimal, but no fork server is much slower anyway.
+		reply_execute(0);
+		receive_execute();
+#endif
+	}
+
 	if (flag_coverage) {
 		int create_count = kCoverDefaultCount, mmap_count = create_count;
 		if (flag_delay_kcov_mmap) {
@@ -706,11 +714,15 @@ void setup_control_pipes()
 
 void receive_handshake()
 {
-	//failmsg("receive handshake triggered", "hi");
 	handshake_req req = {};
 	ssize_t n = read(kInPipeFd, &req, sizeof(req));
 	if (n != sizeof(req))
 		failmsg("handshake read failed", "read=%zu", n);
+	parse_handshake(req);
+}
+
+void parse_handshake(const handshake_req& req)
+{
 	if (req.magic != kInMagic)
 		failmsg("bad handshake magic", "magic=0x%llx", req.magic);
 #if SYZ_HAVE_SANDBOX_ANDROID
@@ -723,7 +735,7 @@ void receive_handshake()
 	program_timeout_ms = req.program_timeout_ms;
 	slowdown_scale = req.slowdown_scale;
 	flag_debug = (bool)(req.flags & rpc::ExecEnv::Debug);
-	flag_coverage = (bool)(req.flags & rpc::ExecEnv::Signal);
+	flag_coverage = 1;
 	flag_sandbox_none = (bool)(req.flags & rpc::ExecEnv::SandboxNone);
 	flag_sandbox_setuid = (bool)(req.flags & rpc::ExecEnv::SandboxSetuid);
 	flag_sandbox_namespace = (bool)(req.flags & rpc::ExecEnv::SandboxNamespace);
@@ -739,13 +751,6 @@ void receive_handshake()
 	flag_wifi = (bool)(req.flags & rpc::ExecEnv::EnableWifi);
 	flag_delay_kcov_mmap = (bool)(req.flags & rpc::ExecEnv::DelayKcovMmap);
 	flag_nic_vf = (bool)(req.flags & rpc::ExecEnv::EnableNicVF);
-	flag_coverage = 1;
-	// debug("flag_coverage: %d", flag_coverage);
-	// debug("req_flags: %lu", static_cast<uint64_t>(req.flags));
-	// debug("Signal: %lu", static_cast<uint64_t>(rpc::ExecEnv::Signal));
-	// sleep_ms(100000000);
-	// failmsg("die", "die");
-	// failmsg("some data", "flag_coverage: %d, req_flags: %lu, Signal: %lu\n", flag_coverage, static_cast<uint64_t>(req.flags), static_cast<uint64_t>(rpc::ExecEnv::Signal));
 }
 
 void receive_execute()
@@ -756,15 +761,19 @@ void receive_execute()
 		;
 	if (n != (ssize_t)sizeof(req))
 		failmsg("control pipe read failed", "read=%zd want=%zd", n, sizeof(req));
+	parse_execute(req);
+}
+
+void parse_execute(const execute_req& req)
+{
 	request_id = req.id;
 	flag_collect_signal = req.exec_flags & (1 << 0);
-	flag_collect_cover = req.exec_flags & (1 << 1);
+	flag_collect_cover = 1;
 	flag_dedup_cover = req.exec_flags & (1 << 2);
 	flag_comparisons = req.exec_flags & (1 << 3);
 	flag_threaded = req.exec_flags & (1 << 4);
 	all_call_signal = req.all_call_signal;
 	all_extra_signal = req.all_extra_signal;
-	flag_collect_cover = 1;
 
 	debug("[%llums] exec opts: procid=%llu threaded=%d cover=%d comps=%d dedup=%d signal=%d "
 	      " sandbox=%d/%d/%d/%d timeouts=%llu/%llu/%llu kernel_64_bit=%d\n",
@@ -775,12 +784,6 @@ void receive_execute()
 	if (syscall_timeout_ms == 0 || program_timeout_ms <= syscall_timeout_ms || slowdown_scale == 0)
 		failmsg("bad timeouts", "syscall=%llu, program=%llu, scale=%llu",
 			syscall_timeout_ms, program_timeout_ms, slowdown_scale);
-	// failmsg("some data", "[%llums] exec opts: procid=%llu threaded=%d cover=%d comps=%d dedup=%d signal=%d "
-	//       " sandbox=%d/%d/%d/%d timeouts=%llu/%llu/%llu kernel_64_bit=%d\n",
-	//       current_time_ms() - start_time_ms, procid, flag_threaded, flag_collect_cover,
-	//       flag_comparisons, flag_dedup_cover, flag_collect_signal, flag_sandbox_none, flag_sandbox_setuid,
-	//       flag_sandbox_namespace, flag_sandbox_android, syscall_timeout_ms, program_timeout_ms, slowdown_scale,
-	//       is_kernel_64_bit);
 }
 
 bool cover_collection_required()
@@ -790,6 +793,8 @@ bool cover_collection_required()
 
 void reply_execute(uint32 status)
 {
+	if (flag_snapshot)
+		SnapshotDone(status == kFailStatus);
 	if (write(kOutPipeFd, &status, sizeof(status)) != sizeof(status))
 		fail("control pipe write failed");
 }
@@ -812,7 +817,10 @@ void realloc_output_data()
 void execute_one()
 {
 	in_execute_one = true;
-	realloc_output_data();
+	if (flag_snapshot)
+		SnapshotStart();
+	else
+		realloc_output_data();
 	output_builder.emplace(output_data, output_size);
 	uint64 start = current_time_ms();
 	uint8* input_pos = input_data;
@@ -1032,7 +1040,9 @@ void execute_one()
 		// that we were killed on timeout before we write any.
 		// Check for extra coverage is very cheap, effectively a memory load.
 		const uint64 kSleepMs = 100;
-		for (uint64 i = 0; i < prog_extra_cover_timeout / kSleepMs; i++) {
+		for (uint64 i = 0; i < prog_extra_cover_timeout / kSleepMs &&
+				   output_data->completed.load(std::memory_order_relaxed) < kMaxCalls;
+		     i++) {
 			sleep_ms(kSleepMs);
 			write_extra_output();
 		}
@@ -1076,7 +1086,7 @@ thread_t* schedule_call(int call_index, int call_num, uint64 copyout_index, uint
 }
 
 template <typename cover_data_t>
-uint32 write_signal(flatbuffers::FlatBufferBuilder& fbb, cover_t* cov, bool all)
+uint32 write_signal(flatbuffers::FlatBufferBuilder& fbb, int index, cover_t* cov, bool all)
 {
 	// Write out feedback signals.
 	// Currently it is code edges computed as xor of two subsequent basic block PCs.
@@ -1099,7 +1109,7 @@ uint32 write_signal(flatbuffers::FlatBufferBuilder& fbb, cover_t* cov, bool all)
 		bool ignore = !filter && !prev_filter;
 		prev_pc = pc;
 		prev_filter = filter;
-		if (ignore || dedup(sig))
+		if (ignore || dedup(index, sig))
 			continue;
 		if (!all && max_signal && max_signal->Contains(sig))
 			continue;
@@ -1108,25 +1118,6 @@ uint32 write_signal(flatbuffers::FlatBufferBuilder& fbb, cover_t* cov, bool all)
 	}
 	return fbb.EndVector(nsig);
 }
-
-//template <typename cover_data_t>
-// uint32 write_cover(flatbuffers::FlatBufferBuilder& fbb, cover_t* cov)
-// {
-// 	//failmsg("some data", "write_cover called");
-// 	uint32 cover_size = cov->size;
-// 	cover_data_t* cover_data = (cover_data_t*)(cov->data + cov->data_offset);
-// 	if (flag_dedup_cover) {
-// 		cover_data_t* end = cover_data + cover_size;
-// 		cover_unprotect(cov);
-// 		std::sort(cover_data, end);
-// 		cover_size = std::unique(cover_data, end) - cover_data;
-// 		cover_protect(cov);
-// 	}
-// 	fbb.StartVector(cover_size, sizeof(uint64));
-// 	for (uint32 i = 0; i < cover_size; i++)
-// 		fbb.PushElement(uint64(cover_data[i] + cov->pc_offset));
-// 	return fbb.EndVector(cover_size);
-// }
 
 template <typename cover_data_t>
 void write_cover(cover_t* cov) {
@@ -1147,10 +1138,7 @@ void write_cover(cover_t* cov) {
 		// debug("address: %lx\n", data_to_write);
     }
 
-    outfile.close();
-
 	debug("Data written to temporary file: %s\n", tmp_filename);
-
 	return;
 }
 
@@ -1164,29 +1152,23 @@ uint32 write_comparisons(flatbuffers::FlatBufferBuilder& fbb, cover_t* cov)
 	cover_unprotect(cov);
 	rpc::ComparisonRaw* start = (rpc::ComparisonRaw*)cov_start;
 	rpc::ComparisonRaw* end = start;
-	// We will convert kcov_comparison_t to ComparisonRaw inplace
-	// and potentially double number of elements, so ensure we have space.
-	static_assert(sizeof(kcov_comparison_t) >= 2 * sizeof(rpc::ComparisonRaw));
+	// We will convert kcov_comparison_t to ComparisonRaw inplace.
+	static_assert(sizeof(kcov_comparison_t) >= sizeof(rpc::ComparisonRaw));
 	for (uint32 i = 0; i < ncomps; i++) {
-		auto [raw, swap, ok] = convert(cov_start[i]);
-		if (!ok)
+		auto raw = convert(cov_start[i]);
+		if (!raw.pc())
 			continue;
 		*end++ = raw;
-		// Compiler marks comparisons with a const with KCOV_CMP_CONST flag.
-		// If the flag is set, then we need to export only one order of operands
-		// (because only one of them could potentially come from the input).
-		// If the flag is not set, then we export both orders as both operands
-		// could come from the input.
-		if (swap)
-			*end++ = {raw.op2(), raw.op1()};
 	}
 	std::sort(start, end, [](rpc::ComparisonRaw a, rpc::ComparisonRaw b) -> bool {
+		if (a.pc() != b.pc())
+			return a.pc() < b.pc();
 		if (a.op1() != b.op1())
 			return a.op1() < b.op1();
 		return a.op2() < b.op2();
 	});
 	ncomps = std::unique(start, end, [](rpc::ComparisonRaw a, rpc::ComparisonRaw b) -> bool {
-			 return a.op1() == b.op1() && a.op2() == b.op2();
+			 return a.pc() == b.pc() && a.op1() == b.op1() && a.op2() == b.op2();
 		 }) -
 		 start;
 	cover_protect(cov);
@@ -1224,6 +1206,7 @@ void handle_completion(thread_t* th)
 				event_isset(&th1->ready), event_isset(&th1->done),
 				th1->call_index, (uint64)th1->res, th1->reserrno);
 		}
+		outfile.close();
 		exitf("negative running");
 	}
 }
@@ -1266,16 +1249,16 @@ void write_output(int index, cover_t* cov, rpc::CallFlag flags, uint32 error, bo
 	const uint32 start_size = output_builder->GetSize();
 	(void)start_size;
 	uint32 signal_off = 0;
-	//uint32 cover_off = 0;
+	uint32 cover_off = 0;
 	uint32 comps_off = 0;
 	if (flag_comparisons) {
 		comps_off = write_comparisons(fbb, cov);
 	} else {
 		if (flag_collect_signal) {
 			if (is_kernel_64_bit)
-				signal_off = write_signal<uint64>(fbb, cov, all_signal);
+				signal_off = write_signal<uint64>(fbb, index, cov, all_signal);
 			else
-				signal_off = write_signal<uint32>(fbb, cov, all_signal);
+				signal_off = write_signal<uint32>(fbb, index, cov, all_signal);
 		}
 		if (flag_collect_cover) {
 			if (is_kernel_64_bit)
@@ -1284,14 +1267,14 @@ void write_output(int index, cover_t* cov, rpc::CallFlag flags, uint32 error, bo
 				write_cover<uint32>(cov);
 		}
 	}
-	
+
 	rpc::CallInfoRawBuilder builder(*output_builder);
 	builder.add_flags(flags);
 	builder.add_error(error);
 	if (signal_off)
 		builder.add_signal(signal_off);
-	// if (cover_off)
-	// 	builder.add_cover(cover_off);
+	if (cover_off)
+		builder.add_cover(cover_off);
 	if (comps_off)
 		builder.add_comps(comps_off);
 	auto off = builder.Finish();
@@ -1331,13 +1314,12 @@ void write_extra_output()
 	if (!extra_cov.size)
 		return;
 	write_output(-1, &extra_cov, rpc::CallFlag::NONE, 997, all_extra_signal);
+	cover_reset(&extra_cov);
 }
 
-flatbuffers::span<uint8_t> finish_output(OutputData* output, int proc_id, uint64 req_id, uint64 elapsed,
+flatbuffers::span<uint8_t> finish_output(OutputData* output, int proc_id, uint64 req_id, uint32 num_calls, uint64 elapsed,
 					 uint64 freshness, uint32 status, const std::vector<uint8_t>* process_output)
 {
-	uint8* prog_data = input_data;
-	uint32 num_calls = read_input(&prog_data);
 	int output_size = output->size.load(std::memory_order_relaxed) ?: kMaxOutput;
 	uint32 completed = output->completed.load(std::memory_order_relaxed);
 	completed = std::min(completed, kMaxCalls);
@@ -1367,7 +1349,7 @@ flatbuffers::span<uint8_t> finish_output(OutputData* output, int proc_id, uint64
 	flatbuffers::Offset<flatbuffers::Vector<uint8_t>> output_off = 0;
 	if (process_output)
 		output_off = fbb.CreateVector(*process_output);
-	auto exec_off = rpc::CreateExecResultRaw(fbb, req_id, output_off, error_off, prog_info_off);
+	auto exec_off = rpc::CreateExecResultRaw(fbb, req_id, proc_id, output_off, error_off, prog_info_off);
 	auto msg_off = rpc::CreateExecutorMessageRaw(fbb, rpc::ExecutorMessagesRaw::ExecResult,
 						     flatbuffers::Offset<void>(exec_off.o));
 	fbb.FinishSizePrefixed(msg_off);
@@ -1493,23 +1475,25 @@ static uint32 hash(uint32 a)
 }
 
 const uint32 dedup_table_size = 8 << 10;
-uint64 dedup_table[dedup_table_size];
+uint64 dedup_table_sig[dedup_table_size];
+uint8 dedup_table_index[dedup_table_size];
 
 // Poorman's best-effort hashmap-based deduplication.
-// The hashmap is global which means that we deduplicate across different calls.
-// This is OK because we are interested only in new signals.
-static bool dedup(uint32 sig)
+static bool dedup(uint8 index, uint64 sig)
 {
 	for (uint32 i = 0; i < 4; i++) {
 		uint32 pos = (sig + i) % dedup_table_size;
-		if (dedup_table[pos] == sig)
+		if (dedup_table_sig[pos] == sig && dedup_table_index[pos] == index)
 			return true;
-		if (dedup_table[pos] == 0) {
-			dedup_table[pos] = sig;
+		if (dedup_table_sig[pos] == 0 || dedup_table_index[pos] != index) {
+			dedup_table_index[pos] = index;
+			dedup_table_sig[pos] = sig;
 			return false;
 		}
 	}
-	dedup_table[sig % dedup_table_size] = sig;
+	uint32 pos = sig % dedup_table_size;
+	dedup_table_sig[pos] = sig;
+	dedup_table_index[pos] = index;
 	return false;
 }
 
@@ -1706,7 +1690,7 @@ uint64 read_input(uint8** input_posp, bool peek)
 	return v;
 }
 
-std::tuple<rpc::ComparisonRaw, bool, bool> convert(const kcov_comparison_t& cmp)
+rpc::ComparisonRaw convert(const kcov_comparison_t& cmp)
 {
 	if (cmp.type > (KCOV_CMP_CONST | KCOV_CMP_SIZE_MASK))
 		failmsg("invalid kcov comp type", "type=%llx", cmp.type);
@@ -1752,7 +1736,7 @@ std::tuple<rpc::ComparisonRaw, bool, bool> convert(const kcov_comparison_t& cmp)
 
 	// Prog package expects operands in the opposite order (first operand may come from the input,
 	// the second operand was computed in the kernel), so swap operands.
-	return {{arg2, arg1}, !(cmp.type & KCOV_CMP_CONST), true};
+	return {cmp.pc, arg2, arg1, !!(cmp.type & KCOV_CMP_CONST)};
 }
 
 void failmsg(const char* err, const char* msg, ...)
@@ -1801,14 +1785,13 @@ void exitf(const char* msg, ...)
 
 void debug(const char* msg, ...)
 {
-	// if (!flag_debug)
-	// 	return;
+	if (!flag_debug)
+		return;
 	int err = errno;
 	va_list args;
 	va_start(args, msg);
 	vfprintf(stderr, msg, args);
 	va_end(args);
-	fprintf(stderr, "\n");
 	fflush(stderr);
 	errno = err;
 }

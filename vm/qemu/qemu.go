@@ -749,6 +749,18 @@ func (inst *instance) sshArgs(args ...string) []string {
 	return append(sshArgs, args...)
 }
 
+func (inst *instance) Port() int {
+    return inst.port
+}
+
+func (inst *instance) SSHUser() string {
+    return inst.sshuser
+}
+
+func (inst *instance) SSHKey() string {
+    return inst.sshkey
+}
+
 // nolint: lll
 const initScript = `#! /bin/bash
 set -eux

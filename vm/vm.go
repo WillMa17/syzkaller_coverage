@@ -19,6 +19,9 @@ import (
 	"strings"
 	"sync/atomic"
 	"time"
+	"os/exec"
+	"strconv"
+
 
 	"github.com/google/syzkaller/pkg/mgrconfig"
 	"github.com/google/syzkaller/pkg/osutil"
@@ -85,6 +88,12 @@ type BootErrorer interface {
 
 type InfraErrorer interface {
 	InfraError() (string, []byte)
+}
+
+type qemuInstance interface {
+    Port() int
+    SSHUser() string
+	SSHKey() string
 }
 
 // vmType splits the VM type from any suffix (separated by ":"). This is mostly
@@ -355,6 +364,42 @@ type monitor struct {
 	extractCalled   bool
 }
 
+func (mon *monitor) sshAndScpFileFromVM() error {
+    remoteFilePath := "/tmp/always-here.txt"
+    currentDir, err := os.Getwd()
+    if err != nil {
+        return fmt.Errorf("failed to get current directory: %v", err)
+    }
+
+    timestamp := time.Now().Format("20060102_150405")
+    localFileName := fmt.Sprintf("coverage_%s.txt", timestamp)
+    localFilePath := fmt.Sprintf("%s/%s", currentDir, localFileName)
+
+	qemuInst, ok := mon.inst.impl.(qemuInstance)
+	if !ok {
+		return fmt.Errorf("instance does not implement qemuInstance")
+	}
+
+    scpCmd := exec.Command(
+		"scp",
+		"-i", qemuInst.SSHKey(),
+		"-P", strconv.Itoa(qemuInst.Port()),
+		"-o", "StrictHostKeyChecking=no", // Skip host key checking
+		fmt.Sprintf("%s@127.0.0.1:%s", qemuInst.SSHUser(), remoteFilePath),
+		localFilePath, 
+	)
+    scpCmd.Stdout = os.Stdout
+    scpCmd.Stderr = os.Stderr
+	fmt.Println("scp command: %s\n", scpCmd)
+
+    if err := scpCmd.Run(); err != nil {
+        return fmt.Errorf("failed to scp file: %v", err)
+    }
+
+    fmt.Println("File successfully copied from VM to local machine")
+    return nil
+}
+
 func (mon *monitor) monitorExecution() *report.Report {
 	ticker := time.NewTicker(tickerPeriod * mon.inst.pool.timeouts.Scale)
 	defer ticker.Stop()
@@ -374,11 +419,19 @@ func (mon *monitor) monitorExecution() *report.Report {
 				if mon.exit&ExitNormal == 0 {
 					crash = lostConnectionCrash
 				}
+				err := mon.sshAndScpFileFromVM()
+                if err != nil {
+                    fmt.Println("Failed to SCP file from VM:", err)
+                }
 				return mon.extractError(crash)
 			case ErrTimeout:
 				if mon.exit&ExitTimeout == 0 {
 					return mon.extractError(timeoutCrash)
 				}
+				err := mon.sshAndScpFileFromVM()
+                if err != nil {
+                    fmt.Println("Failed to SCP file from VM:", err)
+                }
 				return nil
 			default:
 				// Note: connection lost can race with a kernel oops message.

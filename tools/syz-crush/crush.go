@@ -13,7 +13,6 @@ import (
 	"fmt"
 	"log"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"strings"
 	"sync/atomic"
@@ -96,6 +95,13 @@ func main() {
 		go func(index int) {
 			for {
 				runDone <- runInstance(cfg, reporter, vmPool, index, *flagRestartTime, runType)
+				// uniqueFileName := fmt.Sprintf("tmpfile-%d", time.Now().UnixNano())
+				// err := transferFileFromVM("user@remote_host:/tmp/always-here", uniqueFileName)
+				// if err != nil {
+				// 	log.Printf("failed to transfer temporary file: %v", err)
+				// } else {
+				// 	log.Printf("transfered temporary file: %s\n", uniqueFileName)
+				// }
 				if atomic.LoadUint32(&shutdown) != 0 || !*flagInfinite {
 					// If this is the last worker then we can close the channel.
 					if atomic.AddUint32(&stoppedWorkers, 1) == uint32(vmPool.Count()) {
@@ -123,13 +129,6 @@ func main() {
 		if rep != nil {
 			crashes++
 			storeCrash(cfg, rep)
-		} else {
-			uniqueFileName := fmt.Sprintf("local/path/tmpfile-%d", time.Now().UnixNano())
-			err := transferFileFromVM("user@remote_host:/tmp/always-here", uniqueFileName)
-			if err != nil {
-				log.Printf("failed to transfer temporary file: %v", err)
-			}
-			log.Printf("transfered temporary file: %s\n", uniqueFileName)
 		}
 		log.Printf("instances executed: %v, crashes: %v", count, crashes)
 	}
@@ -167,12 +166,12 @@ func storeCrash(cfg *mgrconfig.Config, res *instance.RunResult) {
 	}
 }
 
-func transferFileFromVM(remoteFilePath string, localFilePath string) error {
-    cmd := exec.Command("scp", fmt.Sprintf("user@remote_host:%s", remoteFilePath), localFilePath)
-    cmd.Stdout = os.Stdout
-    cmd.Stderr = os.Stderr
-    return cmd.Run()
-}
+// func transferFileFromVM(remoteFilePath string, localFilePath string) error {
+//     cmd := exec.Command("scp", fmt.Sprintf("user@remote_host:%s", remoteFilePath), localFilePath)
+//     cmd.Stdout = os.Stdout
+//     cmd.Stderr = os.Stderr
+//     return cmd.Run()
+// }
 
 func runInstance(cfg *mgrconfig.Config, reporter *report.Reporter,
 	vmPool *vm.Pool, index int, timeout time.Duration, runType FileType) *instance.RunResult {
