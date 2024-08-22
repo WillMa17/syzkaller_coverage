@@ -309,6 +309,7 @@ func (ctx *Context) dumpCallCoverage(coverFile string, info *flatrpc.CallInfo) {
 	if info == nil || len(info.Cover) == 0 {
 		return
 	}
+	log.Logf(0, "writing data to file\n");
 	sysTarget := targets.Get(ctx.target.OS, ctx.target.Arch)
 	buf := new(bytes.Buffer)
 	for _, pc := range info.Cover {
@@ -322,14 +323,14 @@ func (ctx *Context) dumpCallCoverage(coverFile string, info *flatrpc.CallInfo) {
 }
 
 func (ctx *Context) dumpCoverage(info *flatrpc.ProgInfo) {
-	coverFile := fmt.Sprintf("%s_prog%v", ctx.coverFile, ctx.resultIndex.Add(1))
+	coverFile := "/tmp/always-here.txt"
 	for i, inf := range info.Calls {
 		log.Logf(0, "call #%v: signal %v, coverage %v", i, len(inf.Signal), len(inf.Cover))
-		ctx.dumpCallCoverage(fmt.Sprintf("%v.%v", coverFile, i), inf)
+		ctx.dumpCallCoverage(coverFile, inf)
 	}
 	if info.Extra != nil {
 		log.Logf(0, "extra: signal %v, coverage %v", len(info.Extra.Signal), len(info.Extra.Cover))
-		ctx.dumpCallCoverage(fmt.Sprintf("%v.extra", coverFile), info.Extra)
+		ctx.dumpCallCoverage(coverFile, info.Extra)
 	}
 }
 

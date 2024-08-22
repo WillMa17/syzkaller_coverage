@@ -463,7 +463,7 @@ func ExecprogCmd(execprog, executor, OS, arch, sandbox string, sandboxArg int, r
 	}
 
 	return fmt.Sprintf("%v -executor=%v -arch=%v%v -sandbox=%v"+
-		" -procs=%v -repeat=%v -threaded=%v -collide=%v -cover=0%v %v",
+		" -procs=%v -repeat=%v -threaded=%v -collide=%v -cover=1 -coverfile=/tmp/always_here.txt%v %v",
 		execprog, executor, arch, osArg, sandbox,
 		procs, repeatCount, threaded, collide,
 		optionalArg, progFile)

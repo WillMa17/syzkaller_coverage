@@ -14,8 +14,6 @@
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
-#include <fstream>
-#include <iostream>
 
 #include <atomic>
 #include <optional>
@@ -142,8 +140,6 @@ bool IsSet(T flags, T f)
 // prog execution with neither signal nor coverage. Likely 64kb will be enough in that case.
 
 const uint32 kMaxCalls = 64;
-std::ofstream outfile;
-const char* tmp_filename = "/tmp/always-here.txt";
 
 struct alignas(8) OutputData {
 	std::atomic<uint32> size;
@@ -582,11 +578,6 @@ int main(int argc, char** argv)
 			close(kCoverFilterFd);
 		}
 
-		outfile.open(tmp_filename, std::ios::binary);
-		if (!outfile) {
-			return 1;
-		}
-
 		setup_control_pipes();
 		receive_handshake();
 #if !SYZ_EXECUTOR_USES_FORK_SERVER
@@ -735,7 +726,7 @@ void parse_handshake(const handshake_req& req)
 	program_timeout_ms = req.program_timeout_ms;
 	slowdown_scale = req.slowdown_scale;
 	flag_debug = (bool)(req.flags & rpc::ExecEnv::Debug);
-	flag_coverage = 1;
+	flag_coverage = (bool)(req.flags & rpc::ExecEnv::Signal);
 	flag_sandbox_none = (bool)(req.flags & rpc::ExecEnv::SandboxNone);
 	flag_sandbox_setuid = (bool)(req.flags & rpc::ExecEnv::SandboxSetuid);
 	flag_sandbox_namespace = (bool)(req.flags & rpc::ExecEnv::SandboxNamespace);
@@ -768,7 +759,7 @@ void parse_execute(const execute_req& req)
 {
 	request_id = req.id;
 	flag_collect_signal = req.exec_flags & (1 << 0);
-	flag_collect_cover = 1;
+	flag_collect_cover = req.exec_flags & (1 << 1);
 	flag_dedup_cover = req.exec_flags & (1 << 2);
 	flag_comparisons = req.exec_flags & (1 << 3);
 	flag_threaded = req.exec_flags & (1 << 4);
@@ -1120,26 +1111,21 @@ uint32 write_signal(flatbuffers::FlatBufferBuilder& fbb, int index, cover_t* cov
 }
 
 template <typename cover_data_t>
-void write_cover(cover_t* cov) {
-    uint32_t cover_size = cov->size;
-    cover_data_t* cover_data = (cover_data_t*)(cov->data + cov->data_offset);
-    if (flag_dedup_cover) {
-        cover_data_t* end = cover_data + cover_size;
-        cover_unprotect(cov);
-        std::sort(cover_data, end);
-        cover_size = std::unique(cover_data, end) - cover_data;
-        cover_protect(cov);
-    }
-
-    // Write the cover data to the file
-    for (uint32_t i = 0; i < cover_size; i++) {
-        uint64_t data_to_write = cover_data[i] + cov->pc_offset;
-        outfile.write(reinterpret_cast<const char*>(&data_to_write), sizeof(data_to_write));
-		// debug("address: %lx\n", data_to_write);
-    }
-
-	debug("Data written to temporary file: %s\n", tmp_filename);
-	return;
+uint32 write_cover(flatbuffers::FlatBufferBuilder& fbb, cover_t* cov)
+{
+	uint32 cover_size = cov->size;
+	cover_data_t* cover_data = (cover_data_t*)(cov->data + cov->data_offset);
+	if (flag_dedup_cover) {
+		cover_data_t* end = cover_data + cover_size;
+		cover_unprotect(cov);
+		std::sort(cover_data, end);
+		cover_size = std::unique(cover_data, end) - cover_data;
+		cover_protect(cov);
+	}
+	fbb.StartVector(cover_size, sizeof(uint64));
+	for (uint32 i = 0; i < cover_size; i++)
+		fbb.PushElement(uint64(cover_data[i] + cov->pc_offset));
+	return fbb.EndVector(cover_size);
 }
 
 uint32 write_comparisons(flatbuffers::FlatBufferBuilder& fbb, cover_t* cov)
@@ -1206,7 +1192,6 @@ void handle_completion(thread_t* th)
 				event_isset(&th1->ready), event_isset(&th1->done),
 				th1->call_index, (uint64)th1->res, th1->reserrno);
 		}
-		outfile.close();
 		exitf("negative running");
 	}
 }
@@ -1262,9 +1247,9 @@ void write_output(int index, cover_t* cov, rpc::CallFlag flags, uint32 error, bo
 		}
 		if (flag_collect_cover) {
 			if (is_kernel_64_bit)
-				write_cover<uint64>(cov);
+				cover_off = write_cover<uint64>(fbb, cov);
 			else
-				write_cover<uint32>(cov);
+				cover_off = write_cover<uint32>(fbb, cov);
 		}
 	}
 
